@@ -1,0 +1,25 @@
+<form id="uploadForm" enctype="multipart/form-data">
+  <input type="file" name="audio" accept="audio/*" />
+  <button type="submit">Upload</button>
+</form>
+<div id="result"></div>
+
+<script>
+const form = document.getElementById('uploadForm');
+const resultDiv = document.getElementById('result');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const formData = new FormData(form);
+  const res = await fetch('http://localhost:5000/api/transcribe', {
+    method: 'POST',
+    body: formData
+  });
+  const data = await res.json();
+  if(data.success){
+    resultDiv.innerText = data.transcription;
+  } else {
+    resultDiv.innerText = "Error: " + data.error;
+  }
+});
+</script>
