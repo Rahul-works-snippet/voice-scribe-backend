@@ -1,114 +1,135 @@
-// server/server.js
-import express from "express";
-import multer from "multer";
-import cors from "cors";
-import dotenv from "dotenv";
-import fs from "fs";
-import OpenAI from "openai";
-import { createClient } from "@supabase/supabase-js";
-
-dotenv.config();
+// server.js
+require('dotenv').config(); // Must be first
+const express = require('express');
+const cors = require('cors');
+const fs = require('fs');
+const multer = require('multer');
+const axios = require('axios');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
-app.use(cors());
-app.use(express.json());
+const PORT = process.env.PORT || 5000;
 
-// 🧩 Supabase client (server role)
+// Supabase client (server-side)
 const supabase = createClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY
 );
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+// Middleware
+app.use(cors());
+app.use(express.json());
 
-// 🗂 Multer: temporary storage before upload
+// Ensure uploads folder exists
+if (!fs.existsSync('uploads')) fs.mkdirSync('uploads');
+
+// Multer setup with file filter
 const storage = multer.diskStorage({
-  destination: "uploads/",
-  filename: (req, file, cb) => cb(null, Date.now() + "_" + file.originalname),
+  destination: (req, file, cb) => cb(null, 'uploads/'),
+  filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
-const upload = multer({ storage });
-
-// 🧱 Middleware: verify Supabase token
-async function authenticate(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader) return res.status(401).json({ message: "No auth token" });
-
-  const token = authHeader.split(" ")[1];
-  const { data, error } = await supabase.auth.getUser(token);
-  if (error || !data.user) return res.status(401).json({ message: "Invalid token" });
-
-  req.user = data.user;
-  next();
-}
-
-// 🎙️ Upload route
-app.post("/upload", authenticate, upload.single("audio"), async (req, res) => {
-  try {
-    const filePath = req.file.path;
-    const fileName = req.file.filename;
-
-    // 1️⃣ Upload to Supabase Storage
-    const { data: storageData, error: storageError } = await supabase.storage
-      .from("audio-files")
-      .upload(fileName, fs.createReadStream(filePath), {
-        contentType: req.file.mimetype,
-        upsert: true,
-      });
-
-    if (storageError) throw storageError;
-
-    // 2️⃣ Get public URL
-    const { data: publicURL } = supabase.storage
-      .from("audio-files")
-      .getPublicUrl(fileName);
-
-    // 3️⃣ Transcribe via OpenAI
-    const transcription = await openai.audio.transcriptions.create({
-      file: fs.createReadStream(filePath),
-      model: "whisper-1",
-    });
-
-    // 4️⃣ Save metadata in Supabase DB
-    const { data, error } = await supabase
-      .from("transcriptions")
-      .insert([
-        {
-          user_id: req.user.id,
-          filename: req.file.originalname,
-          transcription: transcription.text,
-          file_url: publicURL.publicUrl,
-          created_at: new Date(),
-        },
-      ]);
-
-    if (error) throw error;
-
-    res.json({
-      message: "✅ Transcription successful!",
-      text: transcription.text,
-      audioURL: publicURL.publicUrl,
-    });
-  } catch (err) {
-    console.error("❌ Upload error:", err);
-    res.status(500).json({ message: "Upload/transcription failed", error: err.message });
+const upload = multer({ 
+  storage,
+  fileFilter: (req, file, cb) => {
+    const allowed = ['audio/mpeg', 'audio/wav', 'audio/mp3', 'audio/m4a'];
+    if (allowed.includes(file.mimetype)) cb(null, true);
+    else cb(new Error('Invalid file type. Only mp3/wav/m4a allowed.'));
   }
 });
 
-// 📜 History (user-specific)
-app.get("/history", authenticate, async (req, res) => {
-  const { data, error } = await supabase
-    .from("transcriptions")
-    .select("*")
-    .eq("user_id", req.user.id)
-    .order("created_at", { ascending: false });
+// Health check
+app.get('/', (req, res) => res.send('Server is running'));
 
-  if (error) return res.status(500).json({ message: "History fetch failed" });
+// Upload & Transcribe
+app.post('/api/transcribe', upload.single('audio'), async (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No audio file provided' });
 
-  res.json(data);
+  const audioPath = req.file.path;
+  const assemblyKey = process.env.ASSEMBLYAI_API_KEY;
+
+  try {
+    // 1️⃣ Upload audio to AssemblyAI
+    const audioData = fs.readFileSync(audioPath);
+    const uploadRes = await axios.post('https://api.assemblyai.com/v2/upload', audioData, {
+      headers: { 
+        authorization: assemblyKey, 
+        'Content-Type': 'application/octet-stream' 
+      }
+    });
+
+    const audioUrl = uploadRes.data.upload_url;
+
+    // 2️⃣ Request transcription
+    const transcriptRes = await axios.post(
+      'https://api.assemblyai.com/v2/transcript',
+      { audio_url: audioUrl },
+      { headers: { authorization: assemblyKey } }
+    );
+
+    const transcriptId = transcriptRes.data.id;
+
+    // 3️⃣ Poll until transcription is complete
+    let transcriptionText = '';
+    let polling = true;
+    const maxAttempts = 60; // 3 min max (60 * 3s)
+    let attempts = 0;
+
+    while (polling && attempts < maxAttempts) {
+      const statusRes = await axios.get(`https://api.assemblyai.com/v2/transcript/${transcriptId}`, {
+        headers: { authorization: assemblyKey }
+      });
+
+      const status = statusRes.data.status;
+
+      if (status === 'completed') {
+        transcriptionText = statusRes.data.text;
+        polling = false;
+      } else if (status === 'failed') {
+        throw new Error('AssemblyAI transcription failed');
+      } else {
+        attempts++;
+        await new Promise(r => setTimeout(r, 3000)); // wait 3 sec
+      }
+    }
+
+    if (polling) throw new Error('Transcription timed out');
+
+    // 4️⃣ Save transcription to Supabase
+    const { error } = await supabase
+      .from('transcriptions')
+      .insert([{ filename: req.file.originalname, transcription_text: transcriptionText }]);
+
+    if (error) console.error('Supabase insert error:', error.message);
+
+    // Cleanup
+    fs.unlinkSync(audioPath);
+
+    // Respond
+    res.json({ success: true, transcription: transcriptionText });
+
+  } catch (err) {
+    console.error('Transcription error:', err.message);
+    if (fs.existsSync(audioPath)) fs.unlinkSync(audioPath);
+    res.status(500).json({ success: false, error: 'Transcription failed', details: err.message });
+  }
 });
 
-app.get("/", (req, res) => res.send("✅ Speech-to-Text API Running..."));
+// Get all transcriptions
+app.get('/api/transcriptions', async (req, res) => {
+  try {
+    const { data, error } = await supabase
+      .from('transcriptions')
+      .select('*')
+      .order('created_at', { ascending: false });
 
-app.listen(process.env.PORT || 5000, () =>
-  console.log(`✅ Server running on port ${process.env.PORT || 5000}`)
-);
+    if (error) return res.status(400).json({ error: error.message });
+
+    res.json(data);
+  } catch (err) {
+    console.error('Fetch transcriptions error:', err.message);
+    res.status(500).json({ error: 'Failed to fetch transcriptions' });
+  }
+});
+
+// Start server
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
